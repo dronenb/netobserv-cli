@@ -39,6 +39,18 @@ fi
 # collector target host
 targetHost="collector.$namespace.svc.cluster.local"
 
+# standard kubectl / oc flags forwarded to every cluster call
+KUBE_FLAGS=()
+# arguments left after extracting kubectl flags
+REMAINING_ARGS=()
+
+# flags taking a value (clientcmd.RecommendedConfigOverrideFlags + kubectl globals)
+KUBE_VALUE_FLAGS=" --as --as-group --as-uid --token --username --password --client-certificate --client-key --server -s --certificate-authority --tls-server-name --proxy-url --context --cluster --user --request-timeout --kubeconfig --cache-dir "
+# boolean flags
+KUBE_BOOL_FLAGS=" --insecure-skip-tls-verify --disable-compression --match-server-version "
+# flags whose values must never be displayed
+KUBE_SECRET_FLAGS=" --token --password "
+
 # eBPF agent image to use
 agentImg="quay.io/netobserv/netobserv-ebpf-agent:main"
 
@@ -191,7 +203,7 @@ metadata:
 }
 
 function clusterIsReady() {
-  ready=$(${K8S_CLI_BIN} get all 2>&1 | grep -c "Unable to connect")
+  ready=$(k8s get all 2>&1 | grep -c "Unable to connect")
   if [[ "${ready}" -gt 0 ]]; then
     return 1
   else
@@ -203,12 +215,12 @@ function checkClusterVersion() {
   # isOCP is a global consumed later (e.g. to enable collector TLS): default to false and flip it to
   # true once we confirm we're talking to an OpenShift cluster.
   isOCP=false
-  states=$(${K8S_CLI_BIN} get clusterversion version -o jsonpath='{.status.history[*].state}')
+  states=$(k8s get clusterversion version -o jsonpath='{.status.history[*].state}')
   if [[ -z "${states}" ]]; then
     echo "Can't check version since cluster is not OpenShift"
   else
     isOCP=true
-    versions=$(${K8S_CLI_BIN} get clusterversion version -o jsonpath='{.status.history[*].version}')
+    versions=$(k8s get clusterversion version -o jsonpath='{.status.history[*].version}')
     version=""
 
     # get the current version finding *Completed* state
@@ -278,7 +290,7 @@ function checkClusterVersion() {
 
 function namespaceFound() {
   # ensure namespace doesn't exist, else we should not override content
-  if ${K8S_CLI_BIN} get namespace "$namespace" --ignore-not-found=true | grep -q "$namespace"; then
+  if k8s get namespace "$namespace" --ignore-not-found=true | grep -q "$namespace"; then
     return 0
   else
     return 1
@@ -289,7 +301,7 @@ function getSubnets() {
   declare -n sn="$1"
 
   # get cluster-config-v1 Configmap to retreive machine networks
-  installConfig=$(${K8S_CLI_BIN} get configmap cluster-config-v1 -n kube-system -o custom-columns=":data.install-config")
+  installConfig=$(k8s get configmap cluster-config-v1 -n kube-system -o custom-columns=":data.install-config")
   yaml="${MANIFEST_OUTPUT_PATH}/${CLUSTER_CONFIG}"
   echo "$installConfig" >"${yaml}"
 
@@ -299,7 +311,7 @@ function getSubnets() {
   fi
 
   # get OCP cluster Network to retreive pod / services / external networks
-  networkConfig=$(${K8S_CLI_BIN} get network cluster -o yaml)
+  networkConfig=$(k8s get network cluster -o yaml)
   yaml="${MANIFEST_OUTPUT_PATH}/${NETWORK_CONFIG}"
   echo "$networkConfig" >"${yaml}"
 
@@ -325,7 +337,7 @@ function getSubnets() {
 
 function getNodesByLabel() {
   printf "finding nodes matching %s...\n" "$1"
-  nodeStr=$("$K8S_CLI_BIN" get nodes -l "$1" -o name | tr '\n' ' ')
+  nodeStr=$(k8s get nodes -l "$1" -o name | tr '\n' ' ')
   IFS=' ' read -ra nodeArray <<<"$nodeStr"
   if [ "${#nodeArray[@]}" -gt 0 ]; then
     printf "%d matching nodes found: %s\n" ${#nodeArray[@]} "$nodeStr" >&2
@@ -333,6 +345,107 @@ function getNodesByLabel() {
     printf "%s doesn't match any node label. Please check your --node-selector parameter\n" "$1" >&2
     exit 1
   fi
+}
+
+function set_namespace() {
+  if [ -z "$1" ]; then
+    echo "namespace cannot be empty" >&2
+    exit 1
+  fi
+  namespace="$1"
+  targetHost="collector.$namespace.svc.cluster.local"
+}
+
+# Split arguments between kubectl / oc global flags (KUBE_FLAGS), the netobserv
+# namespace flag (-n/--namespace) and remaining netobserv args (REMAINING_ARGS)
+function extract_kube_flags() {
+  KUBE_FLAGS=()
+  REMAINING_ARGS=()
+  local arg name value hasValue
+  while [ $# -gt 0 ]; do
+    arg="$1"
+    name="${arg%%=*}"
+    hasValue=false
+    if [[ "$arg" == *=* ]]; then
+      hasValue=true
+      value="${arg#*=}"
+    fi
+    if [[ "$name" == "-n" || "$name" == "--namespace" || "$name" == "-s" || "$KUBE_VALUE_FLAGS" == *" $name "* ]]; then
+      if [[ "$hasValue" == "false" ]]; then
+        if [ $# -lt 2 ]; then
+          echo "flag needs an argument: $name" >&2
+          exit 1
+        fi
+        value="$2"
+        shift
+      fi
+      case "$name" in
+      -n | --namespace)
+        set_namespace "$value"
+        echo "using custom namespace $namespace"
+        ;;
+      -s) KUBE_FLAGS+=("--server=$value") ;;
+      *) KUBE_FLAGS+=("$name=$value") ;;
+      esac
+    elif [[ "$KUBE_BOOL_FLAGS" == *" $name "* ]]; then
+      KUBE_FLAGS+=("$arg")
+    else
+      REMAINING_ARGS+=("$arg")
+    fi
+    shift
+  done
+}
+
+# Run oc / kubectl with forwarded global flags
+function k8s() {
+  "$K8S_CLI_BIN" "${KUBE_FLAGS[@]}" "$@"
+}
+
+# Shell-quote an argument for display, using single quotes when needed
+function quote_arg() {
+  if [[ "$1" =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then
+    printf '%s' "$1"
+  else
+    printf "'%s'" "${1//\'/\'\\\'\'}"
+  fi
+}
+
+# Forwarded flags as a shell-quoted string, hiding secret values
+function kube_flags_display() {
+  local out="" f name
+  for f in "${KUBE_FLAGS[@]}"; do
+    name="${f%%=*}"
+    if [[ "$KUBE_SECRET_FLAGS" == *" $name "* ]]; then
+      out+="$name=<redacted> "
+    else
+      out+="$(quote_arg "$f") "
+    fi
+  done
+  printf '%s' "$out"
+}
+
+# Namespace flag for printed hints when not using the default namespace
+function namespace_display() {
+  if [[ "$namespace" != "netobserv-cli" ]]; then
+    printf -- '-n %s ' "$(quote_arg "$namespace")"
+  fi
+}
+
+# Printable oc / kubectl command with forwarded flags
+function print_cmd() {
+  local out a
+  out="${K8S_CLI_BIN} $(kube_flags_display)"
+  for a in "$@"; do
+    out+="$(quote_arg "$a") "
+  done
+  printf '%s\n' "${out% }"
+}
+
+# Printable netobserv plugin command with forwarded flags and namespace
+function netobserv_cmd() {
+  local out
+  out="${K8S_CLI_BIN} netobserv $1 $(kube_flags_display)$(namespace_display)"
+  printf '%s\n' "${out% }"
 }
 
 function applyYAML() {
@@ -348,7 +461,7 @@ function applyYAML() {
     fi
     echo -e "$output" >"${yaml}"
   else
-    echo "$output" | ${K8S_CLI_BIN} apply -f -
+    echo "$output" | k8s apply -f -
   fi
 }
 
@@ -401,7 +514,7 @@ function setup() {
     fi
 
     if namespaceFound; then
-      printf "%s namespace already exists. Ensure someone else is not running another capture on this cluster. Else use 'oc netobserv cleanup' to remove the namespace first.\n" "$namespace" >&2
+      printf "%s namespace already exists. Ensure someone else is not running another capture on this cluster. Else use '%s' to remove the namespace first.\n" "$namespace" "$(netobserv_cmd cleanup)" >&2
       skipCleanup="true"
       exit 1
     fi
@@ -471,7 +584,7 @@ function setup() {
 }
 
 function follow() {
-  ${K8S_CLI_BIN} logs collector -n "$namespace" -f
+  k8s logs collector -n "$namespace" -f
 }
 
 function copyOutput() {
@@ -479,7 +592,7 @@ function copyOutput() {
   if [[ ! -d ${OUTPUT_PATH} ]]; then
     mkdir -p ${OUTPUT_PATH} >/dev/null
   fi
-  ${K8S_CLI_BIN} cp -n "$namespace" collector:output ./output
+  k8s cp -n "$namespace" collector:output ./output
   flowFile=$(find ./output -name "*txt" | sort | tail -1)
   if [[ -n "$flowFile" ]] ; then
     buildJSON "$flowFile"
@@ -503,27 +616,27 @@ function buildJSON() {
 
 function deleteServiceMonitor() {
   printf "\nDeleting service monitor... "
-  ${K8S_CLI_BIN} delete servicemonitor netobserv-cli -n "$namespace" --ignore-not-found=true
+  k8s delete servicemonitor netobserv-cli -n "$namespace" --ignore-not-found=true
 }
 
 function deleteDashboardCM() {
   printf "\nDeleting dashboard configmap... "
-  ${K8S_CLI_BIN} delete configmap netobserv-cli -n openshift-config-managed --ignore-not-found=true
+  k8s delete configmap netobserv-cli -n openshift-config-managed --ignore-not-found=true
 }
 
 function deleteDaemonset() {
   printf "\nDeleting daemonset... "
-  ${K8S_CLI_BIN} delete daemonset netobserv-cli -n "$namespace" --ignore-not-found=true
+  k8s delete daemonset netobserv-cli -n "$namespace" --ignore-not-found=true
 }
 
 function deletePod() {
   printf "\nDeleting pod... "
-  ${K8S_CLI_BIN} delete pod collector -n "$namespace" --ignore-not-found=true
+  k8s delete pod collector -n "$namespace" --ignore-not-found=true
 }
 
 function deleteNamespace() {
   printf "\nDeleting namespace... "
-  ${K8S_CLI_BIN} delete namespace "$namespace" --ignore-not-found=true
+  k8s delete namespace "$namespace" --ignore-not-found=true
 }
 
 function cleanup() {
@@ -904,9 +1017,9 @@ function waitDaemonset(){
     retries=60
     while [[ $retries -ge 0 ]];do
         sleep 10
-        ready=$($K8S_CLI_BIN -n "$namespace" get daemonset netobserv-cli -o jsonpath="{.status.numberReady}")
-        required=$($K8S_CLI_BIN -n "$namespace" get daemonset netobserv-cli -o jsonpath="{.status.desiredNumberScheduled}")
-        reasons=$($K8S_CLI_BIN get pods -n "$namespace" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}')
+        ready=$(k8s -n "$namespace" get daemonset netobserv-cli -o jsonpath="{.status.numberReady}")
+        required=$(k8s -n "$namespace" get daemonset netobserv-cli -o jsonpath="{.status.desiredNumberScheduled}")
+        reasons=$(k8s get pods -n "$namespace" -o jsonpath='{.items[*].status.containerStatuses[*].state.waiting.reason}')
         IFS=" " read -r -a reasons <<< "$(echo "${reasons[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
         echo "$ready/$required Ready. Reason(s): ${reasons[*]}"
         if printf '%s\0' "${reasons[@]}" | grep -Fxqz -- 'CrashLoopBackOff'; then
@@ -921,16 +1034,16 @@ function waitDaemonset(){
     echo "Collecting diagnostic information..."
     echo
     echo "=== Pod Status ==="
-    ${K8S_CLI_BIN} get pods -n "$namespace" -o wide
+    k8s get pods -n "$namespace" -o wide
     echo
     echo "=== Pod Events ==="
-    ${K8S_CLI_BIN} get events -n "$namespace" --sort-by='.lastTimestamp' | tail -20
+    k8s get events -n "$namespace" --sort-by='.lastTimestamp' | tail -20
     echo
     echo "=== Pod Descriptions ==="
-    ${K8S_CLI_BIN} describe pods -n "$namespace" | grep -A 10 "Events:"
+    k8s describe pods -n "$namespace" | grep -A 10 "Events:"
     echo
     echo "=== Daemonset Logs (if available) ==="
-    ${K8S_CLI_BIN} logs daemonset/netobserv-cli -n "$namespace" --tail=50 2>&1 || echo "No logs available yet"
+    k8s logs daemonset/netobserv-cli -n "$namespace" --tail=50 2>&1 || echo "No logs available yet"
     echo
     exit 1
 }

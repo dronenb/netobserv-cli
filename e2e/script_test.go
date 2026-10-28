@@ -33,6 +33,10 @@ func TestHelpCommand(t *testing.T) {
 		// ensure help to display main commands
 		assert.Contains(t, output, "Main commands:")
 		assert.Contains(t, output, "Syntax: netobserv [flows|packets|metrics|follow|stop|copy|cleanup|version] [options]")
+		// ensure help to display global flags
+		assert.Contains(t, output, "Global flags (can be used with any command, at any position):")
+		assert.Contains(t, output, "-n, --namespace:")
+		assert.Contains(t, output, "--as, --as-group, --as-uid, --kubeconfig, --context")
 		assert.Contains(t, output, "flows      Capture flows information in JSON format using collector pod.")
 		assert.Contains(t, output, "metrics    Capture metrics information in Prometheus using a ServiceMonitor (OCP cluster only).")
 		assert.Contains(t, output, "packets    Capture packets information in pcap format using collector pod.")

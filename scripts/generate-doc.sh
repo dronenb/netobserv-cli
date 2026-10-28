@@ -49,6 +49,26 @@ $ oc netobserv [<command>] [<feature_option>] [<command_options>] <1>
 | help
 | Show help.
 |===
+
+[id=\"cli-global-flags_{context}\"]
+== Global flags
+Global flags can be used with any command, at any position.
+[cols=\"3a,8a\",options=\"header\"]
+.Global flags
+|===
+| Flag | Description
+| -n, --namespace
+| Namespace used by the Network Observability CLI components. Defaults to \`netobserv-cli\`, or the \`NETOBSERV_NAMESPACE\` environment variable.
+| --as, --as-group, --as-uid
+| Impersonate a user, groups or UID for every cluster call.
+| --kubeconfig, --context, --cluster, --user
+| Select the kubeconfig file, context, cluster or user.
+| -s/--server, --token, --username, --password, --certificate-authority, --client-certificate, --client-key, --insecure-skip-tls-verify, --tls-server-name, --proxy-url, --disable-compression
+| Override the connection and authentication settings.
+| --request-timeout, --cache-dir, --match-server-version
+| Standard \`oc\` client settings.
+|===
+Pass the same flags to the \`follow\`, \`stop\`, \`copy\` and \`cleanup\` commands.
 " > $ADOC
 
 # flows table

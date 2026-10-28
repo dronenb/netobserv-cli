@@ -29,6 +29,10 @@ if [ -n "$NETOBSERV_NAMESPACE" ]; then
   namespace="$NETOBSERV_NAMESPACE"
 fi
 
+# extract standard kubectl / oc flags and -n/--namespace from any position
+extract_kube_flags "$@"
+set -- "${REMAINING_ARGS[@]}"
+
 # CLI image to use
 img="quay.io/netobserv/network-observability-cli:main"
 
@@ -178,29 +182,22 @@ if [[ "$command" == "flows" || "$command" == "packets" || "$command" == "metrics
   done
 
   # prepare commands & args
-  runCommand="sleep infinity"
+  collectorArgs=(/network-observability-cli "get-$command")
+  if [ -n "$optionStr" ]; then
+    collectorArgs+=(--options "$optionStr")
+  fi
+  collectorArgs+=(--loglevel "$logLevel" --maxtime "$maxTime" --namespace "$namespace")
+  if [[ "$command" == "flows" || "$command" == "packets" ]]; then
+    collectorArgs+=(--maxbytes "$maxBytes")
+  fi
+
   if [[ "$runBackground" == "true" || "$outputYAML" == "true" ]]; then
-    # For background mode: wrap in bash -c with proper escaping for pod command
-    execCommand="/network-observability-cli get-$command${optionStr:+" --options \\\"${optionStr}\\\""} --loglevel $logLevel --maxtime $maxTime --namespace $namespace"
-    if [[ "$command" == "flows" || "$command" == "packets" ]]; then
-      execCommand="$execCommand --maxbytes $maxBytes"
-    fi
-    runCommand="bash -c \"$execCommand && $runCommand\""
-    execCommand=""
+    # For background mode: run collector in the pod command
+    printf -v collectorCmd '%q ' "${collectorArgs[@]}"
+    runCommand=(bash -c "${collectorCmd}&& sleep infinity")
   else
-    # For foreground mode: will be used in kubectl exec
-    # Build as array to avoid quoting issues
-    execCommandBase="/network-observability-cli get-$command"
-    execCommandArgs="--loglevel $logLevel --maxtime $maxTime --namespace $namespace"
-    if [[ "$command" == "flows" || "$command" == "packets" ]]; then
-      execCommandArgs="$execCommandArgs --maxbytes $maxBytes"
-    fi
-    if [ -n "$optionStr" ]; then
-      # Store options for later use
-      execOptions="$optionStr"
-    else
-      execOptions=""
-    fi
+    # For foreground mode: collector is run later using exec
+    runCommand=(sleep infinity)
   fi
   
   # override extra configs
@@ -208,39 +205,39 @@ if [[ "$command" == "flows" || "$command" == "packets" || "$command" == "metrics
     # resolve-tls initContainer writes the collector-tls-config ConfigMap (resolved from the cluster
     # tlsSecurityProfile) before the collector starts; the collector container consumes it via envFrom
     # so its gRPC server honors the cluster profile instead of hardcoding a TLS version.
-    overrides="'{\"spec\":{\"serviceAccount\":\"netobserv-cli\",\"volumes\":[{\"name\":\"collector-tls\",\"secret\":{\"secretName\":\"collector-tls\"}}],\"initContainers\":[{\"name\":\"resolve-tls\",\"image\":\"$img\",\"imagePullPolicy\":\"Always\",\"command\":[\"/network-observability-cli\",\"resolve-tls\",\"--namespace\",\"$namespace\"]}],\"containers\":[{\"name\":\"collector\",\"image\":\"$img\",\"envFrom\":[{\"configMapRef\":{\"name\":\"collector-tls-config\",\"optional\":false}}],\"volumeMounts\":[{\"name\":\"collector-tls\",\"mountPath\":\"/etc/collector-tls\",\"readOnly\":true}]}]}}'"
+    overrides="{\"spec\":{\"serviceAccount\":\"netobserv-cli\",\"volumes\":[{\"name\":\"collector-tls\",\"secret\":{\"secretName\":\"collector-tls\"}}],\"initContainers\":[{\"name\":\"resolve-tls\",\"image\":\"$img\",\"imagePullPolicy\":\"Always\",\"command\":[\"/network-observability-cli\",\"resolve-tls\",\"--namespace\",\"$namespace\"]}],\"containers\":[{\"name\":\"collector\",\"image\":\"$img\",\"envFrom\":[{\"configMapRef\":{\"name\":\"collector-tls-config\",\"optional\":false}}],\"volumeMounts\":[{\"name\":\"collector-tls\",\"mountPath\":\"/etc/collector-tls\",\"readOnly\":true}]}]}}"
   else
-    overrides="'{\"spec\":{\"serviceAccount\": \"netobserv-cli\"}}'"
+    overrides="{\"spec\":{\"serviceAccount\": \"netobserv-cli\"}}"
   fi
 
-  overrideType=""
+  runArgs=(run -n "$namespace" collector \
+    --image="$img" \
+    --image-pull-policy='Always' \
+    --restart=Never)
   if [[ "$tlsEnabled" == "true" ]]; then
-    overrideType="--override-type=strategic"
+    runArgs+=(--override-type=strategic)
   fi
-  cmd="${K8S_CLI_BIN} run -n $namespace collector \\
-    --image=$img --image-pull-policy='Always' --restart='Never' \\
-    $overrideType --overrides=$overrides \\
-    --command -- $runCommand"
+  runArgs+=(--overrides="$overrides" --command -- "${runCommand[@]}")
 
   if [[ "$outputYAML" == "true" ]]; then
     if [[ "$command" == "flows" || "$command" == "packets" ]]; then
       echo "Check the generated YAML file in output folder."
       echo
       echo "You can create $command agents by executing:"
-      echo " ${K8S_CLI_BIN} apply -f ./output/${command}_capture_${dateName}.yml"
+      echo " $(print_cmd apply -f "./output/${command}_capture_${dateName}.yml")"
       echo
       echo "Then create the collector using:"
-      echo -e " $cmd"
+      echo " $(print_cmd "${runArgs[@]}")"
       echo
       echo "And follow its progression with:"
-      echo " ${K8S_CLI_BIN} logs collector -n $namespace -f"
+      echo " $(print_cmd logs collector -n "$namespace" -f)"
       echo
       exit 0
     else
       echo "Check the generated YAML file in output folder."
       echo
       echo "You can create metrics agents by executing:"
-      echo " ${K8S_CLI_BIN} apply -f ./output/${command}_capture_${dateName}.yml"
+      echo " $(print_cmd apply -f "./output/${command}_capture_${dateName}.yml")"
       echo
       echo "Then open your OCP Console and search for netobserv-cli dashboard"
       echo
@@ -248,10 +245,10 @@ if [[ "$command" == "flows" || "$command" == "packets" || "$command" == "metrics
     fi
   fi
 
-  echo "Running collector $cmd... "
-  eval "$cmd"
+  echo "Running collector $(print_cmd "${runArgs[@]}")... "
+  k8s "${runArgs[@]}"
 
-  ${K8S_CLI_BIN} wait \
+  k8s wait \
     --timeout 120s \
     -n "$namespace" \
     --for=condition=Ready pod/collector || exit 1
@@ -269,24 +266,20 @@ if [[ "$command" == "flows" || "$command" == "packets" || "$command" == "metrics
 
   if [[ "$runBackground" != "true" && "$outputYAML" != "true" ]]; then
     echo "Executing collector command... "
-    if [ -n "$execOptions" ]; then
-      eval "${K8S_CLI_BIN} exec -i --tty -n $namespace collector -- $execCommandBase --options \"$execOptions\" $execCommandArgs"
-    else
-      eval "${K8S_CLI_BIN} exec -i --tty -n $namespace collector -- $execCommandBase $execCommandArgs"
-    fi
+    k8s exec -i --tty -n "$namespace" collector -- "${collectorArgs[@]}"
   elif [[ "$command" == "flows" || "$command" == "packets" ]]; then
     echo "Background capture started. Use:"
-    echo " - '${K8S_CLI_BIN} netobserv follow' to see the capture progress"
-    echo " - '${K8S_CLI_BIN} netobserv copy' to copy the generated files locally"
-    echo " - '${K8S_CLI_BIN} netobserv cleanup' to remove the netobserv components"
+    echo " - '$(netobserv_cmd follow)' to see the capture progress"
+    echo " - '$(netobserv_cmd copy)' to copy the generated files locally"
+    echo " - '$(netobserv_cmd cleanup)' to remove the netobserv components"
     echo
     echo "Capture ends automatically in $maxTime or reaching $maxBytes bytes"
   else
     runBackground="true"
     echo "Metrics capture started."
-    consoleURL="$(oc whoami --show-console)"
+    consoleURL="$(k8s whoami --show-console)"
     echo "Open ${consoleURL}/monitoring/dashboards/netobserv-cli to see generated metrics."
-    echo "Use '${K8S_CLI_BIN} netobserv stop' to stop the collection and '${K8S_CLI_BIN} netobserv cleanup' to remove everything."
+    echo "Use '$(netobserv_cmd stop)' to stop the collection and '$(netobserv_cmd cleanup)' to remove everything."
     echo
     echo "Capture end automatically in $maxTime"
   fi

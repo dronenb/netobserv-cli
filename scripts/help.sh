@@ -35,6 +35,18 @@ highlight_keywords() {
   sed "${sed_args[@]}"
 }
 
+# standard kubectl / oc flags
+function global_flags_usage {
+  echo "Global flags (can be used with any command, at any position):"
+  echo "  -n, --namespace:              namespace used by netobserv components   (default: netobserv-cli, or NETOBSERV_NAMESPACE)"
+  echo "  Standard kubectl / oc flags are forwarded to every cluster call:"
+  echo "    --as, --as-group, --as-uid, --kubeconfig, --context, --cluster, --user, -s/--server, --token,"
+  echo "    --username, --password, --certificate-authority, --client-certificate, --client-key,"
+  echo "    --insecure-skip-tls-verify, --tls-server-name, --proxy-url, --disable-compression,"
+  echo "    --request-timeout, --cache-dir, --match-server-version"
+  echo "  Pass the same flags to follow, stop, copy and cleanup commands."
+}
+
 # display main help
 function help {
   echo
@@ -42,6 +54,8 @@ function help {
   echo "Find more information at: https://github.com/netobserv/network-observability-cli/"
   echo
   echo "Syntax: netobserv [flows|packets|metrics|follow|stop|copy|cleanup|version] [options]"
+  echo
+  global_flags_usage
   echo
   echo "Main commands:"
   echo "  flows      Capture flows information in JSON format using collector pod."
@@ -211,6 +225,8 @@ function flows_usage {
   flowsAndPackets_collector_usage
   script_usage
   echo
+  global_flags_usage
+  echo
   echo "Examples:"
   flows_examples
 }
@@ -229,6 +245,8 @@ function packets_usage {
   flowsAndPackets_collector_usage
   packets_tls_usage
   script_usage
+  echo
+  global_flags_usage
   echo
   echo "Examples:"
   packets_examples
@@ -253,6 +271,8 @@ function metrics_usage {
   script_usage
   metrics_options
   echo
+  global_flags_usage
+  echo
   echo "Examples:"
   metrics_examples
   echo
@@ -265,7 +285,9 @@ function follow_usage {
   echo "While the capture is running in background, you can connect to the collector pod to see the progression using the follow command."
   echo "Find more information at: https://github.com/netobserv/network-observability-cli/"
   echo
-  echo "Syntax: netobserv follow"
+  echo "Syntax: netobserv follow [global flags]"
+  echo
+  global_flags_usage
   echo
 }
 
@@ -275,7 +297,9 @@ function stop_usage {
   echo "While the capture is running, use the stop command to remove the eBPF agents."
   echo "Find more information at: https://github.com/netobserv/network-observability-cli/"
   echo
-  echo "Syntax: netobserv stop"
+  echo "Syntax: netobserv stop [global flags]"
+  echo
+  global_flags_usage
   echo
 }
 
@@ -286,7 +310,9 @@ function copy_usage {
   echo "To avoid modifications during the copy, it's recommended to stop the capture"
   echo "Find more information at: https://github.com/netobserv/network-observability-cli/"
   echo
-  echo "Syntax: netobserv copy"
+  echo "Syntax: netobserv copy [global flags]"
+  echo
+  global_flags_usage
   echo
 }
 
@@ -296,6 +322,8 @@ function cleanup_usage {
   echo "Use the cleanup command to remove all the netobserv CLI components."
   echo "Find more information at: https://github.com/netobserv/network-observability-cli/"
   echo
-  echo "Syntax: netobserv cleanup"
+  echo "Syntax: netobserv cleanup [global flags]"
+  echo
+  global_flags_usage
   echo
 }
